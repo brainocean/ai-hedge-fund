@@ -14,6 +14,8 @@ from src.tools.api import (
 )
 from app.backend.services.graph import run_graph_async, parse_hedge_fund_response
 from app.backend.services.portfolio import create_portfolio
+from app.backend.services.strategies.strategy import TradingStrategy
+from app.backend.services.strategies.strategy_factory import StrategyFactory
 
 class BacktestService:
     """
@@ -23,39 +25,59 @@ class BacktestService:
 
     def __init__(
         self,
-        graph,
         portfolio: dict,
         tickers: List[str],
         start_date: str,
         end_date: str,
         initial_capital: float,
+        strategy: TradingStrategy = None,
+        strategy_type: str = None,
+        graph=None,
         model_name: str = "gpt-4.1",
         model_provider: str = "OpenAI",
+        rules_config: Dict[str, Any] = None,
         request: dict = {},
     ):
         """
         Initialize the backtest service.
         
-        :param graph: Pre-compiled LangGraph graph for trading decisions.
         :param portfolio: Initial portfolio state.
         :param tickers: List of tickers to backtest.
         :param start_date: Start date string (YYYY-MM-DD).
         :param end_date: End date string (YYYY-MM-DD).
         :param initial_capital: Starting portfolio cash.
-        :param model_name: Which LLM model name to use.
-        :param model_provider: Which LLM provider.
+        :param strategy: Pre-configured trading strategy instance.
+        :param strategy_type: Type of strategy to create ("ai" or "rule").
+        :param graph: Pre-compiled LangGraph graph for AI strategy.
+        :param model_name: Which LLM model name to use for AI strategy.
+        :param model_provider: Which LLM provider for AI strategy.
+        :param rules_config: Configuration for rule-based strategy.
         :param request: Request object containing API keys and other metadata.
         """
-        self.graph = graph
         self.portfolio = portfolio
         self.tickers = tickers
         self.start_date = start_date
         self.end_date = end_date
         self.initial_capital = initial_capital
-        self.model_name = model_name
-        self.model_provider = model_provider
         self.request = request
         self.portfolio_values = []
+        
+        # Initialize strategy
+        if strategy is not None:
+            self.strategy = strategy
+        else:
+            self.strategy = StrategyFactory.create_strategy(
+                strategy_type=strategy_type,
+                graph=graph,
+                model_name=model_name,
+                model_provider=model_provider,
+                rules_config=rules_config
+            )
+        
+        # Keep backward compatibility
+        self.graph = graph
+        self.model_name = model_name
+        self.model_provider = model_provider
 
     def execute_trade(self, ticker: str, action: str, quantity: float, current_price: float) -> int:
         """
@@ -359,30 +381,27 @@ class BacktestService:
             # Copy current portfolio state to the graph portfolio
             portfolio_for_graph.update(self.portfolio)
 
-            # Execute graph-based agent decisions
+            # Execute strategy-based decisions
             try:
-                result = await run_graph_async(
-                    graph=self.graph,
-                    portfolio=portfolio_for_graph,
+                decisions = await self.strategy.generate_signals(
                     tickers=self.tickers,
-                    start_date=lookback_start,
-                    end_date=current_date_str,
-                    model_name=self.model_name,
-                    model_provider=self.model_provider,
-                    request=self.request,
+                    current_date=current_date_str,
+                    lookback_start=lookback_start,
+                    portfolio=self.portfolio,
+                    current_prices=current_prices,
+                    request=self.request
                 )
                 
-                # Parse the decisions from the graph result
-                if result and result.get("messages"):
-                    decisions = parse_hedge_fund_response(result["messages"][-1].content)
-                    analyst_signals = result.get("data", {}).get("analyst_signals", {})
-                else:
-                    decisions = {}
+                # For AI strategy, we might have analyst signals
+                analyst_signals = {}
+                if hasattr(self.strategy, 'name') and 'AI' in self.strategy.name:
+                    # This is a fallback for AI strategy compatibility
+                    # In practice, AI strategy should return analyst_signals in metadata
                     analyst_signals = {}
                     
             except Exception as e:
-                print(f"Error running graph for {current_date_str}: {e}")
-                decisions = {}
+                print(f"Error running strategy for {current_date_str}: {e}")
+                decisions = {ticker: {"action": "hold", "quantity": 0} for ticker in self.tickers}
                 analyst_signals = {}
 
             # Execute trades based on decisions
@@ -533,4 +552,4 @@ class BacktestService:
         # Calculate additional metrics
         performance_df["Daily Return"] = performance_df["Portfolio Value"].pct_change().fillna(0)
         
-        return performance_df 
+        return performance_df
